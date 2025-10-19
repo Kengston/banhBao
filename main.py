@@ -23,7 +23,7 @@ async def send_time(message: types.Message):
     # Пример: 14:03:27, 19 Oct 2025 (GMT+7)
     offset_hours = int(now.utcoffset().total_seconds() // 3600)
     formatted = now.strftime("%H:%M:%S, %d %b %Y")
-    await message.reply(f"🕒 Текущее время в Дананге: {formatted} (GMT{offset_hours:+d})")
+    await message.reply(f"🕒 Current time in Danang: {formatted} (GMT{offset_hours:+d})")
 
 app = FastAPI()
 
