@@ -342,8 +342,14 @@ async def on_startup():
         print("WARNING: RENDER_EXTERNAL_URL is empty; webhook won't be set automatically.")
         return
     url = BASE_URL.rstrip("/") + webhook_path
-    await bot.set_webhook(url)
+    # Сбрасываем висящие обновления и явно ограничиваем типы
+    await bot.set_webhook(url, drop_pending_updates=True, allowed_updates=["message", "callback_query"])
+    info = await bot.get_webhook_info()
     print(f"Webhook set to {url}")
+    try:
+        print(f"Webhook info: pending={info.pending_update_count}, last_error={getattr(info, 'last_error_message', None)}")
+    except Exception:
+        pass
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -366,11 +372,20 @@ async def telegram_update(secret: str, request: Request):
         raise HTTPException(status_code=403, detail="forbidden")
 
     data = await request.json()
+    # Простой лог для диагностики
+    try:
+        print("Incoming update keys:", list(data.keys()))
+    except Exception:
+        pass
+    # Парсинг апдейта для aiogram v2
     update = types.Update(**data)
 
     # ВАЖНО: проставляем текущие экземпляры для контекста aiogram v2
     Bot.set_current(bot)
     Dispatcher.set_current(dp)
 
-    await dp.process_update(update)
+    try:
+        await dp.process_update(update)
+    except Exception as e:
+        print("Error processing update:", repr(e))
     return {"ok": True}
