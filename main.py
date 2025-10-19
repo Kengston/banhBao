@@ -7,7 +7,14 @@ from datetime import datetime, timedelta
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
-from typing import Dict, List, Optional
+from typing import Dict
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from urllib.parse import urlparse
+
+# Единый часовой пояс приложения — строго Дананг
+DANANG_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")  # зададите в Render
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # любой секрет
@@ -17,22 +24,22 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher(bot, storage=MemoryStorage())
 
-# Планировщик для напоминаний
-scheduler = AsyncIOScheduler()
+# Планировщик для напоминаний (строго в часовом поясе Дананга)
+scheduler = AsyncIOScheduler(timezone=pytz.timezone("Asia/Ho_Chi_Minh"))
 
 # Файл для хранения событий
 EVENTS_FILE = "events.json"
 
 # Структура события
 class Event:
-    def __init__(self, id: str, title: str, datetime_str: str, user_id: int, description: str = ""):
+    def __init__(self, id: str, title: str, datetime_str: str, chat_id: int, link: str = ""):
         self.id = id
         self.title = title
         self.datetime_str = datetime_str
-        self.user_id = user_id
-        self.description = description
+        self.chat_id = chat_id
+        self.link = link
         self.datetime = datetime.fromisoformat(datetime_str)
     
     def to_dict(self):
@@ -40,8 +47,8 @@ class Event:
             "id": self.id,
             "title": self.title,
             "datetime_str": self.datetime_str,
-            "user_id": self.user_id,
-            "description": self.description
+            "chat_id": self.chat_id,
+            "link": self.link
         }
     
     @classmethod
@@ -50,8 +57,8 @@ class Event:
             id=data["id"],
             title=data["title"],
             datetime_str=data["datetime_str"],
-            user_id=data["user_id"],
-            description=data.get("description", "")
+            chat_id=data.get("chat_id", data.get("user_id")),
+            link=data.get("link", data.get("description", ""))
         )
 
 # Загрузка и сохранение событий
@@ -85,13 +92,13 @@ async def send_reminder(event: Event):
         reminder_text = (
             f"⏰ **Reminder!**\n\n"
             f"**Event:** {event.title}\n"
-            f"**Time:** {event.datetime.strftime('%H:%M, %d %b %Y')}\n"
+            f"**Time:** {event.datetime.astimezone(DANANG_TZ).strftime('%H:%M, %d %b %Y')}\n"
             f"**In:** 10 minutes\n"
         )
-        if event.description:
-            reminder_text += f"**Description:** {event.description}\n"
+        if event.link:
+            reminder_text += f"\n🔗 [Join meeting]({event.link})\n"
         
-        await bot.send_message(event.user_id, reminder_text, parse_mode="Markdown")
+        await bot.send_message(event.chat_id, reminder_text, parse_mode="Markdown", disable_web_page_preview=True)
         print(f"Reminder sent for event: {event.title}")
     except Exception as e:
         print(f"Error sending reminder: {e}")
@@ -101,7 +108,7 @@ async def schedule_reminder(event: Event):
     reminder_time = event.datetime - timedelta(minutes=10)
     
     # Планируем напоминание только если оно в будущем
-    if reminder_time > datetime.now(pytz.timezone("Asia/Ho_Chi_Minh")):
+    if reminder_time > datetime.now(DANANG_TZ):
         scheduler.add_job(
             send_reminder,
             trigger=DateTrigger(run_date=reminder_time),
@@ -135,86 +142,119 @@ async def send_links(message: types.Message):
     await message.reply(links_text, parse_mode="Markdown", disable_web_page_preview=True)
 
 # Команда /add_event — добавление события
-@dp.message_handler(commands=["add_event"])
-async def add_event(message: types.Message):
-    """Добавляет новое событие в расписание"""
-    args = message.get_args().strip()
-    
-    if not args:
-        help_text = (
-            "📅 **Add Event**\n\n"
-            "Usage: `/add_event Title | YYYY-MM-DD HH:MM | Description`\n\n"
-            "**Example:**\n"
-            "`/add_event Team Meeting | 2024-01-15 14:30 | Discuss project progress`\n\n"
-            "**Note:** Time is in Danang timezone (GMT+7)"
-        )
-        await message.reply(help_text, parse_mode="Markdown")
-        return
-    
+class AddEventStates(StatesGroup):
+    waiting_for_datetime = State()
+    waiting_for_title = State()
+    waiting_for_link = State()
+
+def _is_valid_url(url: str) -> bool:
     try:
-        parts = args.split('|')
-        if len(parts) < 2:
-            raise ValueError("Invalid format")
-        
-        title = parts[0].strip()
-        datetime_str = parts[1].strip()
-        description = parts[2].strip() if len(parts) > 2 else ""
-        
-        # Парсим дату и время
-        event_datetime = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M")
-        # Конвертируем в часовой пояс Дананга
-        tz = pytz.timezone("Asia/Ho_Chi_Minh")
-        event_datetime = tz.localize(event_datetime)
-        
-        # Проверяем, что событие в будущем
-        if event_datetime <= datetime.now(tz):
-            await message.reply("❌ Event must be in the future!", parse_mode="Markdown")
-            return
-        
-        # Создаем событие
-        event_id = f"{message.from_user.id}_{int(event_datetime.timestamp())}"
-        event = Event(
-            id=event_id,
-            title=title,
-            datetime_str=event_datetime.isoformat(),
-            user_id=message.from_user.id,
-            description=description
-        )
-        
-        # Сохраняем событие
-        events[event_id] = event
-        await save_events(events)
-        
-        # Планируем напоминание
-        await schedule_reminder(event)
-        
-        success_text = (
-            f"✅ **Event Added!**\n\n"
-            f"**Title:** {title}\n"
-            f"**Date & Time:** {event_datetime.strftime('%H:%M, %d %b %Y')}\n"
-            f"**Reminder:** 10 minutes before\n"
-        )
-        if description:
-            success_text += f"**Description:** {description}\n"
-        
-        await message.reply(success_text, parse_mode="Markdown")
-        
-    except ValueError as e:
-        error_text = (
-            "❌ **Invalid Format**\n\n"
-            "Please use: `/add_event Title | YYYY-MM-DD HH:MM | Description`\n\n"
-            "**Example:**\n"
-            "`/add_event Team Meeting | 2024-01-15 14:30 | Discuss project progress`"
-        )
-        await message.reply(error_text, parse_mode="Markdown")
-    except Exception as e:
-        await message.reply(f"❌ Error adding event: {str(e)}", parse_mode="Markdown")
+        parsed = urlparse(url)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+@dp.message_handler(commands=["add_event"])
+async def add_event(message: types.Message, state: FSMContext):
+    """Многошаговое создание события: дата/время -> название -> ссылка"""
+    # Старт: просим дату и время в Дананге
+    prompt = (
+        "📅 **Create Event**\n\n"
+        "Send date and time in Danang timezone (GMT+7) in format:\n"
+        "`YYYY-MM-DD HH:MM`\n\n"
+        "Example: `2025-10-19 21:30`"
+    )
+    sent = await message.reply(prompt, parse_mode="Markdown")
+    await state.update_data(_msg_ids=[sent.message_id, message.message_id])
+    await AddEventStates.waiting_for_datetime.set()
+
+@dp.message_handler(state=AddEventStates.waiting_for_datetime, content_types=types.ContentTypes.TEXT)
+async def add_event_datetime_step(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    try:
+        naive_dt = datetime.strptime(text, "%Y-%m-%d %H:%M")
+        event_dt = DANANG_TZ.localize(naive_dt)
+        if event_dt <= datetime.now(DANANG_TZ):
+            raise ValueError("past")
+        data = await state.get_data()
+        msg_ids = data.get("_msg_ids", []) + [message.message_id]
+        await state.update_data(event_dt=event_dt.isoformat(), _msg_ids=msg_ids)
+        sent = await message.reply("📝 Now send the event title", parse_mode="Markdown")
+        await state.update_data(_msg_ids=msg_ids + [sent.message_id])
+        await AddEventStates.waiting_for_title.set()
+    except Exception:
+        err = await message.reply("❌ Invalid datetime. Use `YYYY-MM-DD HH:MM` in Danang time.", parse_mode="Markdown")
+        data = await state.get_data()
+        await state.update_data(_msg_ids=(data.get("_msg_ids", []) + [message.message_id, err.message_id]))
+
+@dp.message_handler(state=AddEventStates.waiting_for_title, content_types=types.ContentTypes.TEXT)
+async def add_event_title_step(message: types.Message, state: FSMContext):
+    title = message.text.strip()
+    if not title:
+        err = await message.reply("❌ Title cannot be empty. Send the title.")
+        data = await state.get_data()
+        await state.update_data(_msg_ids=(data.get("_msg_ids", []) + [message.message_id, err.message_id]))
+        return
+    data = await state.get_data()
+    msg_ids = data.get("_msg_ids", []) + [message.message_id]
+    await state.update_data(title=title, _msg_ids=msg_ids)
+    sent = await message.reply("🔗 Send the meeting link (http/https)")
+    await state.update_data(_msg_ids=msg_ids + [sent.message_id])
+    await AddEventStates.waiting_for_link.set()
+
+@dp.message_handler(state=AddEventStates.waiting_for_link, content_types=types.ContentTypes.TEXT)
+async def add_event_link_step(message: types.Message, state: FSMContext):
+    link = message.text.strip()
+    if not _is_valid_url(link):
+        err = await message.reply("❌ Invalid URL. Send a valid http/https link.")
+        data = await state.get_data()
+        await state.update_data(_msg_ids=(data.get("_msg_ids", []) + [message.message_id, err.message_id]))
+        return
+    data = await state.get_data()
+    msg_ids = data.get("_msg_ids", []) + [message.message_id]
+    event_dt_iso = data.get("event_dt")
+    title = data.get("title")
+    event_dt = datetime.fromisoformat(event_dt_iso)
+    event_id = f"{message.chat.id}_{int(event_dt.timestamp())}"
+    event = Event(
+        id=event_id,
+        title=title,
+        datetime_str=event_dt.isoformat(),
+        chat_id=message.chat.id,
+        link=link
+    )
+    # Сохраняем
+    events[event_id] = event
+    await save_events(events)
+    # Планируем напоминание
+    await schedule_reminder(event)
+
+    # Удаляем промежуточные сообщения
+    try:
+        for mid in set(msg_ids):
+            try:
+                await bot.delete_message(chat_id=message.chat.id, message_id=mid)
+            except Exception:
+                pass
+    finally:
+        pass
+
+    # Итоговое сообщение-только одно
+    final_text = (
+        "✅ **Event Created!**\n\n"
+        f"**Title:** {title}\n"
+        f"**Date & Time (Danang):** {event_dt.astimezone(DANANG_TZ).strftime('%H:%M, %d %b %Y')}\n"
+        f"🔗 [Join meeting]({link})\n"
+        "⏰ Reminder will be sent 10 minutes before."
+    )
+    await message.reply(final_text, parse_mode="Markdown", disable_web_page_preview=True)
+    await state.finish()
 
 # Команда /list_events — список событий
 @dp.message_handler(commands=["list_events"])
 async def list_events(message: types.Message):
     """Показывает список событий пользователя"""
-    user_events = [event for event in events.values() if event.user_id == message.from_user.id]
+    user_events = [event for event in events.values() if event.chat_id == message.chat.id]
     
     if not user_events:
         await message.reply("📅 **No events scheduled**\n\nUse `/add_event` to create one!", parse_mode="Markdown")
@@ -227,8 +267,8 @@ async def list_events(message: types.Message):
     for i, event in enumerate(user_events, 1):
         events_text += f"**{i}.** {event.title}\n"
         events_text += f"   📅 {event.datetime.strftime('%H:%M, %d %b %Y')}\n"
-        if event.description:
-            events_text += f"   📝 {event.description}\n"
+        # Описание убрано; показываем, есть ли ссылка
+        events_text += f"   🔗 {('link attached' if event.link else 'no link')}\n"
         events_text += f"   🆔 `{event.id}`\n\n"
     
     events_text += "Use `/delete_event <ID>` to remove an event"
@@ -245,11 +285,11 @@ async def delete_event(message: types.Message):
         await message.reply("❌ Please provide event ID\n\nUse `/list_events` to see your events", parse_mode="Markdown")
         return
     
-    if event_id in events and events[event_id].user_id == message.from_user.id:
+    if event_id in events and events[event_id].chat_id == message.chat.id:
         # Удаляем напоминание из планировщика
         try:
             scheduler.remove_job(f"reminder_{event_id}")
-        except:
+        except Exception:
             pass
         
         # Удаляем событие
@@ -270,14 +310,11 @@ async def help_command(message: types.Message):
         "🕒 `/time` - Current time in Danang\n"
         "🔗 `/links` - Useful links (Miro, Jira)\n\n"
         "📅 **Event Management:**\n"
-        "➕ `/add_event` - Add new event\n"
+        "➕ `/add_event` - Create new event (step-by-step)\n"
         "📋 `/list_events` - List your events\n"
         "🗑️ `/delete_event <ID>` - Delete event\n\n"
-        "**Event Format:**\n"
-        "`/add_event Title | YYYY-MM-DD HH:MM | Description`\n\n"
-        "**Example:**\n"
-        "`/add_event Team Meeting | 2024-01-15 14:30 | Discuss project progress`\n\n"
-        "⏰ Reminders are sent 10 minutes before each event!"
+        "Creation flow: send datetime (Danang) -> title -> meeting link.\n\n"
+        "⏰ Reminders are sent 10 minutes before each event with the link!"
     )
     await message.reply(help_text, parse_mode="Markdown")
 
@@ -322,7 +359,7 @@ async def on_shutdown():
 async def health():
     return {"ok": True}
 
-@app.post(f"/webhook/{{secret}}")
+@app.post("/webhook/{secret}")
 async def telegram_update(secret: str, request: Request):
     # Проверяем секрет, чтобы не принимать чужие запросы
     if secret != WEBHOOK_SECRET:
