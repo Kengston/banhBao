@@ -440,7 +440,7 @@ async def telegram_update(secret: str, request: Request):
     Dispatcher.set_current(dp)
 
     try:
-    await dp.process_update(update)
+        await dp.process_update(update)
     except Exception as e:
         print("Error processing update:", repr(e))
 
