@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
-from typing import Dict
+from typing import Dict, Optional
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
@@ -154,6 +154,33 @@ def _is_valid_url(url: str) -> bool:
     except Exception:
         return False
 
+def _parse_danang_datetime(text: str) -> Optional[datetime]:
+    # Нормализуем пробелы и разделители (замена нестандартных Unicode)
+    normalized = (
+        text.replace("\u2013", "-")  # en dash
+            .replace("\u2014", "-")  # em dash
+            .replace("\u2212", "-")  # minus sign
+            .replace("\u00A0", " ")  # non-breaking space
+            .replace("\u2007", " ")  # figure space
+            .replace("\u202F", " ")  # narrow no-break space
+            .replace("：", ":")      # fullwidth colon
+            .replace("／", "/")      # fullwidth slash
+            .replace("－", "-")      # fullwidth hyphen-minus
+    )
+    cleaned = " ".join(normalized.strip().split())
+    formats = [
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d %H:%M",
+        "%Y.%m.%d %H:%M",
+    ]
+    for fmt in formats:
+        try:
+            naive = datetime.strptime(cleaned, fmt)
+            return DANANG_TZ.localize(naive)
+        except Exception:
+            continue
+    return None
+
 @dp.message_handler(commands=["add_event"])
 async def add_event(message: types.Message, state: FSMContext):
     """Многошаговое создание события: дата/время -> название -> ссылка"""
@@ -164,41 +191,65 @@ async def add_event(message: types.Message, state: FSMContext):
         "`YYYY-MM-DD HH:MM`\n\n"
         "Example: `2025-10-19 21:30`"
     )
-    sent = await message.reply(prompt, parse_mode="Markdown")
+    sent = await message.reply(
+        prompt,
+        parse_mode="Markdown",
+        reply_markup=types.ForceReply(selective=True)
+    )
     await state.update_data(_msg_ids=[sent.message_id, message.message_id])
     await AddEventStates.waiting_for_datetime.set()
 
 @dp.message_handler(state=AddEventStates.waiting_for_datetime, content_types=types.ContentTypes.TEXT)
 async def add_event_datetime_step(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    try:
-        naive_dt = datetime.strptime(text, "%Y-%m-%d %H:%M")
-        event_dt = DANANG_TZ.localize(naive_dt)
-        if event_dt <= datetime.now(DANANG_TZ):
-            raise ValueError("past")
-        data = await state.get_data()
-        msg_ids = data.get("_msg_ids", []) + [message.message_id]
-        await state.update_data(event_dt=event_dt.isoformat(), _msg_ids=msg_ids)
-        sent = await message.reply("📝 Now send the event title", parse_mode="Markdown")
-        await state.update_data(_msg_ids=msg_ids + [sent.message_id])
-        await AddEventStates.waiting_for_title.set()
-    except Exception:
-        err = await message.reply("❌ Invalid datetime. Use `YYYY-MM-DD HH:MM` in Danang time.", parse_mode="Markdown")
+    text = message.text or ""
+    event_dt = _parse_danang_datetime(text)
+    if event_dt is None:
+        err = await message.reply(
+            "❌ Invalid datetime. Use `YYYY-MM-DD HH:MM` in Danang time.",
+            parse_mode="Markdown",
+            reply_markup=types.ForceReply(selective=True)
+        )
         data = await state.get_data()
         await state.update_data(_msg_ids=(data.get("_msg_ids", []) + [message.message_id, err.message_id]))
+        return
+    now_danang = datetime.now(DANANG_TZ)
+    if event_dt <= now_danang:
+        err = await message.reply(
+            f"❌ Time must be in the future. Now in Danang: {now_danang.strftime('%Y-%m-%d %H:%M')}",
+            reply_markup=types.ForceReply(selective=True)
+        )
+        data = await state.get_data()
+        await state.update_data(_msg_ids=(data.get("_msg_ids", []) + [message.message_id, err.message_id]))
+        return
+    data = await state.get_data()
+    msg_ids = data.get("_msg_ids", []) + [message.message_id]
+    await state.update_data(event_dt=event_dt.isoformat(), _msg_ids=msg_ids)
+    sent = await message.reply(
+        "📝 Now send the event title",
+        parse_mode="Markdown",
+        reply_markup=types.ForceReply(selective=True)
+    )
+    await state.update_data(_msg_ids=msg_ids + [sent.message_id])
+    await AddEventStates.waiting_for_title.set()
 
 @dp.message_handler(state=AddEventStates.waiting_for_title, content_types=types.ContentTypes.TEXT)
 async def add_event_title_step(message: types.Message, state: FSMContext):
     title = message.text.strip()
     if not title:
-        err = await message.reply("❌ Title cannot be empty. Send the title.")
+        err = await message.reply(
+            "❌ Title cannot be empty. Send the title.",
+            reply_markup=types.ForceReply(selective=True)
+        )
         data = await state.get_data()
         await state.update_data(_msg_ids=(data.get("_msg_ids", []) + [message.message_id, err.message_id]))
         return
     data = await state.get_data()
     msg_ids = data.get("_msg_ids", []) + [message.message_id]
     await state.update_data(title=title, _msg_ids=msg_ids)
-    sent = await message.reply("🔗 Send the meeting link (http/https)")
+    sent = await message.reply(
+        "🔗 Send the meeting link (http/https)",
+        reply_markup=types.ForceReply(selective=True)
+    )
     await state.update_data(_msg_ids=msg_ids + [sent.message_id])
     await AddEventStates.waiting_for_link.set()
 
@@ -206,7 +257,10 @@ async def add_event_title_step(message: types.Message, state: FSMContext):
 async def add_event_link_step(message: types.Message, state: FSMContext):
     link = message.text.strip()
     if not _is_valid_url(link):
-        err = await message.reply("❌ Invalid URL. Send a valid http/https link.")
+        err = await message.reply(
+            "❌ Invalid URL. Send a valid http/https link.",
+            reply_markup=types.ForceReply(selective=True)
+        )
         data = await state.get_data()
         await state.update_data(_msg_ids=(data.get("_msg_ids", []) + [message.message_id, err.message_id]))
         return
@@ -377,6 +431,7 @@ async def telegram_update(secret: str, request: Request):
         print("Incoming update keys:", list(data.keys()))
     except Exception:
         pass
+
     # Парсинг апдейта для aiogram v2
     update = types.Update(**data)
 
@@ -385,7 +440,8 @@ async def telegram_update(secret: str, request: Request):
     Dispatcher.set_current(dp)
 
     try:
-        await dp.process_update(update)
+    await dp.process_update(update)
     except Exception as e:
         print("Error processing update:", repr(e))
+
     return {"ok": True}
