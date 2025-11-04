@@ -189,7 +189,8 @@ async def add_event(message: types.Message, state: FSMContext):
         "📅 **Create Event**\n\n"
         "Send date and time in Danang timezone (GMT+7) in format:\n"
         "`YYYY-MM-DD HH:MM`\n\n"
-        "Example: `2025-10-19 21:30`"
+        "Example: `2025-10-19 21:30`\n\n"
+        "💡 Use `/cancel` to cancel event creation"
     )
     sent = await message.reply(
         prompt,
@@ -199,13 +200,48 @@ async def add_event(message: types.Message, state: FSMContext):
     await state.update_data(_msg_ids=[sent.message_id, message.message_id])
     await AddEventStates.waiting_for_datetime.set()
 
+@dp.message_handler(commands=["cancel"], state="*")
+async def cancel_event(message: types.Message, state: FSMContext):
+    """Отменяет текущее создание события"""
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.reply("Nothing to cancel", parse_mode="Markdown")
+        return
+    
+    # Удаляем промежуточные сообщения если есть
+    try:
+        data = await state.get_data()
+        msg_ids = data.get("_msg_ids", [])
+        for mid in set(msg_ids):
+            try:
+                await message.bot.delete_message(chat_id=message.chat.id, message_id=mid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    
+    await state.finish()
+    await message.reply("✅ **Event creation cancelled**", parse_mode="Markdown")
+
 @dp.message_handler(state=AddEventStates.waiting_for_datetime, content_types=types.ContentTypes.TEXT)
 async def add_event_datetime_step(message: types.Message, state: FSMContext):
     text = message.text or ""
+    
+    # Проверяем, не является ли это командой (если пользователь передумал)
+    if text.startswith('/'):
+        # Отменяем текущее состояние и пусть команда обработается
+        await state.finish()
+        # Сообщаем об отмене
+        await message.reply(
+            "⚠️ **Event creation cancelled**\n\nUse `/add_event` to start again",
+            parse_mode="Markdown"
+        )
+        return
+    
     event_dt = _parse_danang_datetime(text)
     if event_dt is None:
         err = await message.reply(
-            "❌ Invalid datetime. Use `YYYY-MM-DD HH:MM` in Danang time.",
+            "❌ Invalid datetime. Use `YYYY-MM-DD HH:MM` in Danang time.\n\n💡 Use `/cancel` to cancel",
             parse_mode="Markdown",
             reply_markup=types.ForceReply(selective=True)
         )
@@ -235,9 +271,19 @@ async def add_event_datetime_step(message: types.Message, state: FSMContext):
 @dp.message_handler(state=AddEventStates.waiting_for_title, content_types=types.ContentTypes.TEXT)
 async def add_event_title_step(message: types.Message, state: FSMContext):
     title = message.text.strip()
+    
+    # Проверяем, не является ли это командой
+    if title.startswith('/'):
+        await state.finish()
+        await message.reply(
+            "⚠️ **Event creation cancelled**\n\nUse `/add_event` to start again",
+            parse_mode="Markdown"
+        )
+        return
+    
     if not title:
         err = await message.reply(
-            "❌ Title cannot be empty. Send the title.",
+            "❌ Title cannot be empty. Send the title.\n\n💡 Use `/cancel` to cancel",
             reply_markup=types.ForceReply(selective=True)
         )
         data = await state.get_data()
@@ -256,9 +302,19 @@ async def add_event_title_step(message: types.Message, state: FSMContext):
 @dp.message_handler(state=AddEventStates.waiting_for_link, content_types=types.ContentTypes.TEXT)
 async def add_event_link_step(message: types.Message, state: FSMContext):
     link = message.text.strip()
+    
+    # Проверяем, не является ли это командой
+    if link.startswith('/'):
+        await state.finish()
+        await message.reply(
+            "⚠️ **Event creation cancelled**\n\nUse `/add_event` to start again",
+            parse_mode="Markdown"
+        )
+        return
+    
     if not _is_valid_url(link):
         err = await message.reply(
-            "❌ Invalid URL. Send a valid http/https link.",
+            "❌ Invalid URL. Send a valid http/https link.\n\n💡 Use `/cancel` to cancel",
             reply_markup=types.ForceReply(selective=True)
         )
         data = await state.get_data()
@@ -356,19 +412,24 @@ async def delete_event(message: types.Message):
         await message.reply("❌ Event not found or you don't have permission to delete it", parse_mode="Markdown")
 
 # Команда /help — справка по всем командам
-@dp.message_handler(commands=["help"])
+@dp.message_handler(commands=["help", "start", "info"])
 async def help_command(message: types.Message):
     """Показывает справку по всем доступным командам"""
     help_text = (
         "🤖 **Bot Commands:**\n\n"
         "🕒 `/time` - Current time in Danang\n"
-        "🔗 `/links` - Useful links (Miro, Jira)\n\n"
+        "🔗 `/links` - Useful links (Miro, Jira)\n"
+        "ℹ️ `/help` - Show this help message\n\n"
         "📅 **Event Management:**\n"
         "➕ `/add_event` - Create new event (step-by-step)\n"
         "📋 `/list_events` - List your events\n"
-        "🗑️ `/delete_event <ID>` - Delete event\n\n"
-        "Creation flow: send datetime (Danang) -> title -> meeting link.\n\n"
-        "⏰ Reminders are sent 10 minutes before each event with the link!"
+        "🗑️ `/delete_event <ID>` - Delete event\n"
+        "❌ `/cancel` - Cancel current operation\n\n"
+        "**Creating events:**\n"
+        "1. Send datetime in Danang timezone (GMT+7)\n"
+        "2. Send event title\n"
+        "3. Send meeting link\n\n"
+        "⏰ Reminders are sent 10 minutes before each event!"
     )
     await message.reply(help_text, parse_mode="Markdown")
 
