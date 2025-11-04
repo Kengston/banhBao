@@ -450,6 +450,9 @@ async def on_startup():
     scheduler.start()
     print("Scheduler started")
     
+    # Регистрируем все обработчики
+    print(f"📋 Registered handlers: {len(dp.message_handlers.handlers)}")
+    
     # Путь вебхука с секретом
     webhook_path = f"/webhook/{WEBHOOK_SECRET}"
     
@@ -466,7 +469,15 @@ async def on_startup():
     url = BASE_URL.rstrip("/") + webhook_path
     print(f"Attempting to set webhook to: {url}")
     
-    # Сбрасываем висящие обновления и явно ограничиваем типы
+    # ВАЖНО: Сначала полностью удаляем старый webhook
+    try:
+        print("🔄 Deleting old webhook first...")
+        await bot.delete_webhook(drop_pending_updates=True)
+        print("✅ Old webhook deleted")
+    except Exception as e:
+        print(f"⚠️ Error deleting old webhook (this is OK): {repr(e)}")
+    
+    # Теперь устанавливаем новый webhook
     try:
         await bot.set_webhook(url, drop_pending_updates=True, allowed_updates=["message", "callback_query"])
         info = await bot.get_webhook_info()
@@ -500,7 +511,6 @@ async def health():
 @app.post("/webhook/{secret}")
 async def telegram_update(secret: str, request: Request):
     print(f"📨 Received POST request to /webhook/{secret}")
-    print(f"Request headers: {dict(request.headers)}")
     
     # Проверяем секрет, чтобы не принимать чужие запросы
     if secret != WEBHOOK_SECRET:
@@ -510,17 +520,26 @@ async def telegram_update(secret: str, request: Request):
     data = await request.json()
     # Детальное логирование для диагностики
     print("✅ Incoming Telegram update:")
-    print(f"  - Update keys: {list(data.keys())}")
-    print(f"  - Full data: {json.dumps(data, indent=2, ensure_ascii=False)}")
+    print(f"  - Update ID: {data.get('update_id')}")
+    if 'message' in data:
+        msg = data['message']
+        print(f"  - Message from user: {msg.get('from', {}).get('id')}")
+        print(f"  - Message text: {msg.get('text', 'N/A')}")
+        print(f"  - Chat ID: {msg.get('chat', {}).get('id')}")
 
     # Парсинг апдейта для aiogram v2
-    update = types.Update(**data)
+    try:
+        update = types.Update(**data)
+    except Exception as e:
+        print(f"❌ Error parsing update: {repr(e)}")
+        return {"ok": False}
 
     # ВАЖНО: проставляем текущие экземпляры для контекста aiogram v2
     Bot.set_current(bot)
     Dispatcher.set_current(dp)
 
     try:
+        print(f"🔄 Processing update with {len(dp.message_handlers.handlers)} handlers...")
         await dp.process_update(update)
         print("✅ Update processed successfully")
     except Exception as e:
