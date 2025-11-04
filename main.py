@@ -474,11 +474,15 @@ async def on_startup():
         print("🔄 Deleting old webhook first...")
         await bot.delete_webhook(drop_pending_updates=True)
         print("✅ Old webhook deleted")
+        # Даем Telegram время обработать удаление
+        import asyncio
+        await asyncio.sleep(2)
     except Exception as e:
         print(f"⚠️ Error deleting old webhook (this is OK): {repr(e)}")
     
     # Теперь устанавливаем новый webhook
     try:
+        print(f"🔄 Setting new webhook after delay...")
         await bot.set_webhook(url, drop_pending_updates=True, allowed_updates=["message", "callback_query"])
         info = await bot.get_webhook_info()
         print(f"✅ Webhook successfully set to {url}")
@@ -506,7 +510,38 @@ async def on_shutdown():
 
 @app.get("/")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "bot": "online", "handlers": len(dp.message_handlers.handlers)}
+
+@app.get("/webhook-info")
+async def webhook_info():
+    """Эндпоинт для проверки статуса webhook"""
+    try:
+        info = await bot.get_webhook_info()
+        return {
+            "url": info.url,
+            "pending_updates": info.pending_update_count,
+            "last_error_date": info.last_error_date,
+            "last_error_message": info.last_error_message,
+            "max_connections": info.max_connections,
+            "allowed_updates": info.allowed_updates
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/test-webhook")
+async def test_webhook():
+    """Тестовый эндпоинт для проверки, что сервер принимает POST запросы"""
+    print("🧪 Test webhook endpoint called!")
+    return {"ok": True, "message": "Test endpoint works"}
+
+@app.get("/test-send/{chat_id}")
+async def test_send_message(chat_id: int):
+    """Отправляет тестовое сообщение в указанный чат"""
+    try:
+        await bot.send_message(chat_id, "🧪 Test message from server!")
+        return {"ok": True, "message": f"Sent test message to {chat_id}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.post("/webhook/{secret}")
 async def telegram_update(secret: str, request: Request):
