@@ -391,19 +391,36 @@ async def on_startup():
     
     # Путь вебхука с секретом
     webhook_path = f"/webhook/{WEBHOOK_SECRET}"
+    
+    # Логирование всех переменных окружения для отладки
+    print(f"BOT_TOKEN is set: {bool(BOT_TOKEN)}")
+    print(f"WEBHOOK_SECRET: {WEBHOOK_SECRET}")
+    print(f"BASE_URL from env: {BASE_URL}")
+    
     if not BASE_URL:
         # На первом старте Render может не прокинуть env
         print("WARNING: RENDER_EXTERNAL_URL is empty; webhook won't be set automatically.")
         return
+    
     url = BASE_URL.rstrip("/") + webhook_path
+    print(f"Attempting to set webhook to: {url}")
+    
     # Сбрасываем висящие обновления и явно ограничиваем типы
-    await bot.set_webhook(url, drop_pending_updates=True, allowed_updates=["message", "callback_query"])
-    info = await bot.get_webhook_info()
-    print(f"Webhook set to {url}")
     try:
-        print(f"Webhook info: pending={info.pending_update_count}, last_error={getattr(info, 'last_error_message', None)}")
-    except Exception:
-        pass
+        await bot.set_webhook(url, drop_pending_updates=True, allowed_updates=["message", "callback_query"])
+        info = await bot.get_webhook_info()
+        print(f"✅ Webhook successfully set to {url}")
+        print(f"Webhook info:")
+        print(f"  - URL: {info.url}")
+        print(f"  - Pending updates: {info.pending_update_count}")
+        print(f"  - Last error date: {info.last_error_date}")
+        print(f"  - Last error message: {info.last_error_message}")
+        print(f"  - Max connections: {info.max_connections}")
+        print(f"  - Allowed updates: {info.allowed_updates}")
+    except Exception as e:
+        print(f"❌ ERROR setting webhook: {repr(e)}")
+        import traceback
+        traceback.print_exc()
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -421,16 +438,19 @@ async def health():
 
 @app.post("/webhook/{secret}")
 async def telegram_update(secret: str, request: Request):
+    print(f"📨 Received POST request to /webhook/{secret}")
+    print(f"Request headers: {dict(request.headers)}")
+    
     # Проверяем секрет, чтобы не принимать чужие запросы
     if secret != WEBHOOK_SECRET:
+        print(f"❌ Secret mismatch! Expected: {WEBHOOK_SECRET}, Got: {secret}")
         raise HTTPException(status_code=403, detail="forbidden")
 
     data = await request.json()
-    # Простой лог для диагностики
-    try:
-        print("Incoming update keys:", list(data.keys()))
-    except Exception:
-        pass
+    # Детальное логирование для диагностики
+    print("✅ Incoming Telegram update:")
+    print(f"  - Update keys: {list(data.keys())}")
+    print(f"  - Full data: {json.dumps(data, indent=2, ensure_ascii=False)}")
 
     # Парсинг апдейта для aiogram v2
     update = types.Update(**data)
@@ -441,7 +461,10 @@ async def telegram_update(secret: str, request: Request):
 
     try:
         await dp.process_update(update)
+        print("✅ Update processed successfully")
     except Exception as e:
-        print("Error processing update:", repr(e))
+        print(f"❌ Error processing update: {repr(e)}")
+        import traceback
+        traceback.print_exc()
 
     return {"ok": True}
