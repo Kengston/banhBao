@@ -118,6 +118,59 @@ async def schedule_reminder(event: Event):
         )
         print(f"Scheduled reminder for event {event.title} at {reminder_time}")
 
+async def keep_alive_ping():
+    """Пингует собственный сервер чтобы он не засыпал (для Render Free Tier)"""
+    import aiohttp
+    if not BASE_URL:
+        return
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{BASE_URL}/") as resp:
+                if resp.status == 200:
+                    print("✅ Keep-alive ping successful")
+                else:
+                    print(f"⚠️ Keep-alive ping returned {resp.status}")
+    except Exception as e:
+        print(f"❌ Keep-alive ping failed: {e}")
+
+async def check_and_fix_webhook():
+    """Проверяет webhook и переустанавливает если нужно"""
+    if not BASE_URL:
+        return
+    
+    try:
+        info = await bot.get_webhook_info()
+        webhook_url = f"{BASE_URL.rstrip('/')}/webhook/{WEBHOOK_SECRET}"
+        
+        print(f"🔍 Checking webhook...")
+        print(f"  Expected: {webhook_url}")
+        print(f"  Current: {info.url}")
+        print(f"  Pending updates: {info.pending_update_count}")
+        
+        # Проверяем, правильно ли установлен webhook
+        if info.url != webhook_url:
+            print(f"⚠️ Webhook URL mismatch! Re-setting...")
+            await bot.delete_webhook(drop_pending_updates=True)
+            import asyncio
+            await asyncio.sleep(2)
+            await bot.set_webhook(webhook_url, drop_pending_updates=True, allowed_updates=["message", "callback_query"])
+            print("✅ Webhook re-set successfully")
+        elif info.last_error_message:
+            print(f"⚠️ Webhook has error: {info.last_error_message}")
+            print("🔄 Re-setting webhook to fix errors...")
+            await bot.delete_webhook(drop_pending_updates=True)
+            import asyncio
+            await asyncio.sleep(2)
+            await bot.set_webhook(webhook_url, drop_pending_updates=True, allowed_updates=["message", "callback_query"])
+            print("✅ Webhook re-set after error")
+        else:
+            print("✅ Webhook is healthy")
+    except Exception as e:
+        print(f"❌ Error checking webhook: {e}")
+        import traceback
+        traceback.print_exc()
+
 # Команда /time — точное время в Дананге
 @dp.message_handler(commands=["time"])
 async def send_time(message: types.Message):
@@ -449,6 +502,28 @@ async def on_startup():
     # Запускаем планировщик
     scheduler.start()
     print("Scheduler started")
+    
+    # Добавляем периодические задачи для поддержания работоспособности на Render Free Tier
+    
+    # Keep-alive пинг каждые 10 минут (чтобы сервер не засыпал)
+    scheduler.add_job(
+        keep_alive_ping,
+        trigger='interval',
+        minutes=10,
+        id='keep_alive',
+        replace_existing=True
+    )
+    print("✅ Keep-alive ping scheduled (every 10 minutes)")
+    
+    # Проверка и восстановление webhook каждые 30 минут
+    scheduler.add_job(
+        check_and_fix_webhook,
+        trigger='interval',
+        minutes=30,
+        id='webhook_check',
+        replace_existing=True
+    )
+    print("✅ Webhook health check scheduled (every 30 minutes)")
     
     # Регистрируем все обработчики
     print(f"📋 Registered handlers: {len(dp.message_handlers.handlers)}")
