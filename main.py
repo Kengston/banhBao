@@ -200,6 +200,16 @@ class AddEventStates(StatesGroup):
     waiting_for_title = State()
     waiting_for_link = State()
 
+# Команда /delete_event — удаление события
+class DeleteEventStates(StatesGroup):
+    waiting_for_selection = State()
+
+# Команда /edit_event — редактирование события
+class EditEventStates(StatesGroup):
+    waiting_for_selection = State()
+    waiting_for_field = State()
+    waiting_for_new_value = State()
+
 def _is_valid_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
@@ -430,39 +440,345 @@ async def list_events(message: types.Message):
     for i, event in enumerate(user_events, 1):
         events_text += f"**{i}.** {event.title}\n"
         events_text += f"   📅 {event.datetime.strftime('%H:%M, %d %b %Y')}\n"
-        # Описание убрано; показываем, есть ли ссылка
-        events_text += f"   🔗 {('link attached' if event.link else 'no link')}\n"
-        events_text += f"   🆔 `{event.id}`\n\n"
+        events_text += f"   🔗 {('link attached' if event.link else 'no link')}\n\n"
     
-    events_text += "Use `/delete_event <ID>` to remove an event"
+    events_text += "Use `/delete_event` to delete or `/edit_event` to modify"
     
     await message.reply(events_text, parse_mode="Markdown")
 
 # Команда /delete_event — удаление события
 @dp.message_handler(commands=["delete_event"])
-async def delete_event(message: types.Message):
-    """Удаляет событие по ID"""
-    event_id = message.get_args().strip()
+async def delete_event_start(message: types.Message, state: FSMContext):
+    """Начинает процесс удаления события - показывает список для выбора"""
+    user_events = [event for event in events.values() if event.chat_id == message.chat.id]
     
-    if not event_id:
-        await message.reply("❌ Please provide event ID\n\nUse `/list_events` to see your events", parse_mode="Markdown")
+    if not user_events:
+        await message.reply("📅 **No events to delete**\n\nUse `/add_event` to create one!", parse_mode="Markdown")
         return
     
-    if event_id in events and events[event_id].chat_id == message.chat.id:
-        # Удаляем напоминание из планировщика
+    # Сортируем по дате
+    user_events.sort(key=lambda x: x.datetime)
+    
+    events_text = "🗑️ **Delete Event**\n\nSelect event to delete:\n\n"
+    for i, event in enumerate(user_events, 1):
+        events_text += f"**{i}.** {event.title}\n"
+        events_text += f"   📅 {event.datetime.strftime('%H:%M, %d %b %Y')}\n\n"
+    
+    events_text += "Send the **number** or **title** of the event to delete\n"
+    events_text += "💡 Use `/cancel` to cancel"
+    
+    sent = await message.reply(events_text, parse_mode="Markdown", reply_markup=types.ForceReply(selective=True))
+    await state.update_data(_msg_ids=[sent.message_id, message.message_id], user_events=user_events)
+    await DeleteEventStates.waiting_for_selection.set()
+
+@dp.message_handler(state=DeleteEventStates.waiting_for_selection, content_types=types.ContentTypes.TEXT)
+async def delete_event_selection(message: types.Message, state: FSMContext):
+    """Обрабатывает выбор события для удаления"""
+    text = message.text.strip()
+    
+    # Проверяем, не команда ли это
+    if text.startswith('/'):
+        await state.finish()
+        await message.reply("⚠️ **Deletion cancelled**", parse_mode="Markdown")
+        return
+    
+    data = await state.get_data()
+    user_events = data.get("user_events", [])
+    
+    selected_event = None
+    
+    # Пытаемся найти по номеру
+    if text.isdigit():
+        idx = int(text) - 1
+        if 0 <= idx < len(user_events):
+            selected_event = user_events[idx]
+    
+    # Если не нашли по номеру, ищем по названию (частичное совпадение, регистронезависимое)
+    if not selected_event:
+        text_lower = text.lower()
+        for event in user_events:
+            if text_lower in event.title.lower():
+                selected_event = event
+                break
+    
+    if not selected_event:
+        err = await message.reply(
+            f"❌ Event not found. Send the **number** or **title**\n\n💡 Use `/cancel` to cancel",
+            parse_mode="Markdown",
+            reply_markup=types.ForceReply(selective=True)
+        )
+        msg_ids = data.get("_msg_ids", []) + [message.message_id, err.message_id]
+        await state.update_data(_msg_ids=msg_ids)
+        return
+    
+    # Удаляем событие
+    # Удаляем напоминание из планировщика
+    try:
+        scheduler.remove_job(f"reminder_{selected_event.id}")
+    except Exception:
+        pass
+    
+    event_title = selected_event.title
+    del events[selected_event.id]
+    await save_events(events)
+    
+    # Удаляем промежуточные сообщения
+    try:
+        msg_ids = data.get("_msg_ids", []) + [message.message_id]
+        for mid in set(msg_ids):
+            try:
+                await message.bot.delete_message(chat_id=message.chat.id, message_id=mid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    
+    await message.reply(f"✅ **Event deleted:** {event_title}", parse_mode="Markdown")
+    await state.finish()
+
+@dp.message_handler(commands=["edit_event"])
+async def edit_event_start(message: types.Message, state: FSMContext):
+    """Начинает процесс редактирования события - показывает список для выбора"""
+    user_events = [event for event in events.values() if event.chat_id == message.chat.id]
+    
+    if not user_events:
+        await message.reply("📅 **No events to edit**\n\nUse `/add_event` to create one!", parse_mode="Markdown")
+        return
+    
+    # Сортируем по дате
+    user_events.sort(key=lambda x: x.datetime)
+    
+    events_text = "✏️ **Edit Event**\n\nSelect event to edit:\n\n"
+    for i, event in enumerate(user_events, 1):
+        events_text += f"**{i}.** {event.title}\n"
+        events_text += f"   📅 {event.datetime.strftime('%H:%M, %d %b %Y')}\n"
+        events_text += f"   🔗 {('link attached' if event.link else 'no link')}\n\n"
+    
+    events_text += "Send the **number** or **title** of the event to edit\n"
+    events_text += "💡 Use `/cancel` to cancel"
+    
+    sent = await message.reply(events_text, parse_mode="Markdown", reply_markup=types.ForceReply(selective=True))
+    await state.update_data(_msg_ids=[sent.message_id, message.message_id], user_events=user_events)
+    await EditEventStates.waiting_for_selection.set()
+
+@dp.message_handler(state=EditEventStates.waiting_for_selection, content_types=types.ContentTypes.TEXT)
+async def edit_event_selection(message: types.Message, state: FSMContext):
+    """Обрабатывает выбор события для редактирования"""
+    text = message.text.strip()
+    
+    # Проверяем, не команда ли это
+    if text.startswith('/'):
+        await state.finish()
+        await message.reply("⚠️ **Editing cancelled**", parse_mode="Markdown")
+        return
+    
+    data = await state.get_data()
+    user_events = data.get("user_events", [])
+    
+    selected_event = None
+    
+    # Пытаемся найти по номеру
+    if text.isdigit():
+        idx = int(text) - 1
+        if 0 <= idx < len(user_events):
+            selected_event = user_events[idx]
+    
+    # Если не нашли по номеру, ищем по названию
+    if not selected_event:
+        text_lower = text.lower()
+        for event in user_events:
+            if text_lower in event.title.lower():
+                selected_event = event
+                break
+    
+    if not selected_event:
+        err = await message.reply(
+            f"❌ Event not found. Send the **number** or **title**\n\n💡 Use `/cancel` to cancel",
+            parse_mode="Markdown",
+            reply_markup=types.ForceReply(selective=True)
+        )
+        msg_ids = data.get("_msg_ids", []) + [message.message_id, err.message_id]
+        await state.update_data(_msg_ids=msg_ids)
+        return
+    
+    # Показываем текущие данные и спрашиваем что редактировать
+    event_info = (
+        f"✏️ **Edit Event:** {selected_event.title}\n\n"
+        f"Current details:\n"
+        f"**1.** Date & Time: `{selected_event.datetime.strftime('%Y-%m-%d %H:%M')}`\n"
+        f"**2.** Title: `{selected_event.title}`\n"
+        f"**3.** Link: {('`' + selected_event.link + '`' if selected_event.link else '`no link`')}\n\n"
+        f"What do you want to edit? Send **1**, **2**, or **3**\n"
+        f"💡 Use `/cancel` to cancel"
+    )
+    
+    msg_ids = data.get("_msg_ids", []) + [message.message_id]
+    sent = await message.reply(event_info, parse_mode="Markdown", reply_markup=types.ForceReply(selective=True))
+    await state.update_data(
+        _msg_ids=msg_ids + [sent.message_id],
+        selected_event_id=selected_event.id
+    )
+    await EditEventStates.waiting_for_field.set()
+
+@dp.message_handler(state=EditEventStates.waiting_for_field, content_types=types.ContentTypes.TEXT)
+async def edit_event_field_selection(message: types.Message, state: FSMContext):
+    """Обрабатывает выбор поля для редактирования"""
+    text = message.text.strip()
+    
+    # Проверяем, не команда ли это
+    if text.startswith('/'):
+        await state.finish()
+        await message.reply("⚠️ **Editing cancelled**", parse_mode="Markdown")
+        return
+    
+    data = await state.get_data()
+    event_id = data.get("selected_event_id")
+    
+    if event_id not in events:
+        await message.reply("❌ Event not found", parse_mode="Markdown")
+        await state.finish()
+        return
+    
+    event = events[event_id]
+    field_prompts = {
+        "1": ("datetime", "📅 Send new date and time in Danang timezone (GMT+7):\n`YYYY-MM-DD HH:MM`\n\nExample: `2025-10-20 15:30`"),
+        "2": ("title", "📝 Send new event title:"),
+        "3": ("link", "🔗 Send new meeting link (http/https):")
+    }
+    
+    if text not in field_prompts:
+        err = await message.reply(
+            f"❌ Invalid choice. Send **1**, **2**, or **3**\n\n💡 Use `/cancel` to cancel",
+            parse_mode="Markdown",
+            reply_markup=types.ForceReply(selective=True)
+        )
+        msg_ids = data.get("_msg_ids", []) + [message.message_id, err.message_id]
+        await state.update_data(_msg_ids=msg_ids)
+        return
+    
+    field_name, prompt = field_prompts[text]
+    msg_ids = data.get("_msg_ids", []) + [message.message_id]
+    sent = await message.reply(prompt, parse_mode="Markdown", reply_markup=types.ForceReply(selective=True))
+    
+    await state.update_data(
+        _msg_ids=msg_ids + [sent.message_id],
+        edit_field=field_name
+    )
+    await EditEventStates.waiting_for_new_value.set()
+
+@dp.message_handler(state=EditEventStates.waiting_for_new_value, content_types=types.ContentTypes.TEXT)
+async def edit_event_new_value(message: types.Message, state: FSMContext):
+    """Обрабатывает новое значение для редактируемого поля"""
+    text = message.text.strip()
+    
+    # Проверяем, не команда ли это
+    if text.startswith('/'):
+        await state.finish()
+        await message.reply("⚠️ **Editing cancelled**", parse_mode="Markdown")
+        return
+    
+    data = await state.get_data()
+    event_id = data.get("selected_event_id")
+    field_name = data.get("edit_field")
+    
+    if event_id not in events:
+        await message.reply("❌ Event not found", parse_mode="Markdown")
+        await state.finish()
+        return
+    
+    event = events[event_id]
+    
+    # Валидация и применение изменений
+    if field_name == "datetime":
+        new_datetime = _parse_danang_datetime(text)
+        if not new_datetime:
+            err = await message.reply(
+                "❌ Invalid datetime. Use `YYYY-MM-DD HH:MM` in Danang time.\n\n💡 Use `/cancel` to cancel",
+                parse_mode="Markdown",
+                reply_markup=types.ForceReply(selective=True)
+            )
+            msg_ids = data.get("_msg_ids", []) + [message.message_id, err.message_id]
+            await state.update_data(_msg_ids=msg_ids)
+            return
+        
+        now_danang = datetime.now(DANANG_TZ)
+        if new_datetime <= now_danang:
+            err = await message.reply(
+                f"❌ Time must be in the future. Now in Danang: {now_danang.strftime('%Y-%m-%d %H:%M')}\n\n💡 Use `/cancel` to cancel",
+                parse_mode="Markdown",
+                reply_markup=types.ForceReply(selective=True)
+            )
+            msg_ids = data.get("_msg_ids", []) + [message.message_id, err.message_id]
+            await state.update_data(_msg_ids=msg_ids)
+            return
+        
+        # Обновляем дату
+        event.datetime = new_datetime
+        event.datetime_str = new_datetime.isoformat()
+        
+        # Переустанавливаем напоминание
         try:
             scheduler.remove_job(f"reminder_{event_id}")
         except Exception:
             pass
+        await schedule_reminder(event)
         
-        # Удаляем событие
-        event_title = events[event_id].title
-        del events[event_id]
-        await save_events(events)
+    elif field_name == "title":
+        if not text:
+            err = await message.reply(
+                "❌ Title cannot be empty.\n\n💡 Use `/cancel` to cancel",
+                parse_mode="Markdown",
+                reply_markup=types.ForceReply(selective=True)
+            )
+            msg_ids = data.get("_msg_ids", []) + [message.message_id, err.message_id]
+            await state.update_data(_msg_ids=msg_ids)
+            return
+        event.title = text
         
-        await message.reply(f"✅ **Event deleted:** {event_title}", parse_mode="Markdown")
-    else:
-        await message.reply("❌ Event not found or you don't have permission to delete it", parse_mode="Markdown")
+    elif field_name == "link":
+        if not _is_valid_url(text):
+            err = await message.reply(
+                "❌ Invalid URL. Send a valid http/https link.\n\n💡 Use `/cancel` to cancel",
+                parse_mode="Markdown",
+                reply_markup=types.ForceReply(selective=True)
+            )
+            msg_ids = data.get("_msg_ids", []) + [message.message_id, err.message_id]
+            await state.update_data(_msg_ids=msg_ids)
+            return
+        event.link = text
+    
+    # Сохраняем изменения
+    events[event_id] = event
+    await save_events(events)
+    
+    # Удаляем промежуточные сообщения
+    try:
+        msg_ids = data.get("_msg_ids", []) + [message.message_id]
+        for mid in set(msg_ids):
+            try:
+                await message.bot.delete_message(chat_id=message.chat.id, message_id=mid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    
+    # Показываем обновленное событие
+    field_labels = {
+        "datetime": "Date & Time",
+        "title": "Title",
+        "link": "Link"
+    }
+    
+    success_text = (
+        f"✅ **Event updated!**\n\n"
+        f"**{event.title}**\n"
+        f"📅 {event.datetime.strftime('%H:%M, %d %b %Y')}\n"
+        f"🔗 {event.link if event.link else 'no link'}\n\n"
+        f"Updated field: **{field_labels[field_name]}**"
+    )
+    
+    await message.reply(success_text, parse_mode="Markdown")
+    await state.finish()
 
 # Команда /help — справка по всем командам
 @dp.message_handler(commands=["help", "start", "info"])
@@ -474,14 +790,15 @@ async def help_command(message: types.Message):
         "🔗 `/links` - Useful links (Miro, Jira)\n"
         "ℹ️ `/help` - Show this help message\n\n"
         "📅 **Event Management:**\n"
-        "➕ `/add_event` - Create new event (step-by-step)\n"
+        "➕ `/add_event` - Create new event\n"
         "📋 `/list_events` - List your events\n"
-        "🗑️ `/delete_event <ID>` - Delete event\n"
+        "✏️ `/edit_event` - Edit existing event\n"
+        "🗑️ `/delete_event` - Delete event\n"
         "❌ `/cancel` - Cancel current operation\n\n"
-        "**Creating events:**\n"
-        "1. Send datetime in Danang timezone (GMT+7)\n"
-        "2. Send event title\n"
-        "3. Send meeting link\n\n"
+        "**How it works:**\n"
+        "• Creating: datetime → title → link\n"
+        "• Editing: select event → choose field → new value\n"
+        "• Deleting: select event by number or name\n\n"
         "⏰ Reminders are sent 10 minutes before each event!"
     )
     await message.reply(help_text, parse_mode="Markdown")
